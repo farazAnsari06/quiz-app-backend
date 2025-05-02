@@ -15,6 +15,7 @@ const rateLimit = require('express-rate-limit');
 
 // Routes
 const questionsRoutes = require('./routes/questions');
+const Question = require('./models/Question');
 
 // Initialize Express app
 const app = express();
@@ -190,16 +191,29 @@ io.on('connection', (socket) => {
     if (!player || !player.isHost) return;
     
     try {
-      // Fetch questions from the database based on category
-      const response = await fetch(`http://localhost:3000/api/questions?category=${category}&limit=20`);
-      const data = await response.json();
+      // Directly query the database instead of making an HTTP request
+      const questions = await Question.aggregate([
+        { $match: { category: category } },
+        { $sample: { size: 15 } },
+        { 
+          $project: {
+            _id: 1,
+            question: 1,
+            options: 1,
+            correctAnswer: 1,
+            category: 1,
+            difficulty: 1
+          }
+        }
+      ]);
+
       
-      if (!data.questions || data.questions.length < 20) {
+      if (!questions || questions.length < 10) {
         io.to(roomId).emit('error', { message: 'Not enough questions available' });
         return;
       }
       
-      room.questions = data.questions;
+      room.questions = questions;
       room.gameStarted = true;
       room.category = category;
       room.currentQuestionIndex = 0;
@@ -229,9 +243,11 @@ io.on('connection', (socket) => {
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
     
-    const currentQuestion = room.questions[room.currentQuestionIndex];
+    // Mark this player as having answered
+    player.hasAnswered = true;
     
     // Check if answer is correct
+    const currentQuestion = room.questions[room.currentQuestionIndex];
     if (currentQuestion.correctAnswer === answer) {
       player.score += 10; // Award 10 points for correct answer
     }
@@ -280,54 +296,72 @@ io.on('connection', (socket) => {
   });
 
   // Handle single player quiz start
-  socket.on('startSinglePlayer', async ({ category }) => {
-    try {
-      // Fetch questions from the database based on category
-      const response = await fetch(`http://localhost:3000/api/questions?category=${category}&limit=20`);
-      const data = await response.json();
-      
-      if (!data.questions || data.questions.length < 20) {
-        socket.emit('error', { message: 'Not enough questions available' });
-        return;
+  // Handle single player quiz start
+socket.on('startSinglePlayer', async ({ category }) => {
+  try {
+    console.log(`Starting single player game for category: ${category}`);
+    
+    // Directly query the database instead of making an HTTP request
+    const questions = await Question.aggregate([
+      { $match: { category: category } },
+      { $sample: { size: 15 } },
+      { 
+        $project: {
+          _id: 1,
+          question: 1,
+          options: 1,
+          correctAnswer: 1,
+          category: 1,
+          difficulty: 1
+        }
       }
-      
-      // Create a session ID for this single player game
-      const sessionId = uuidv4();
-      
-      // Store the game session
-      gameRooms[sessionId] = {
-        id: sessionId,
-        players: [{
-          id: socket.id,
-          username: 'Player',
-          score: 0,
-          isReady: true
-        }],
-        category,
-        gameStarted: true,
-        questions: data.questions,
-        currentQuestionIndex: 0,
-        singlePlayer: true
-      };
-      
-      socket.join(sessionId);
-      
-      // Send the first question
-      socket.emit('singlePlayerStarted', {
-        sessionId,
-        question: {
-          ...data.questions[0],
-          answer: undefined // Don't send the answer to client
-        },
-        totalQuestions: data.questions.length,
-        currentQuestion: 1
-      });
-      
-    } catch (err) {
-      console.error('Error starting single player game:', err);
-      socket.emit('error', { message: 'Failed to start game' });
+    ]);
+    
+    console.log(`Found ${questions.length} questions for category: ${category}`);
+    
+    if (questions.length < 2) {
+      console.log('Not enough questions available');
+      socket.emit('error', { message: 'Not enough questions available for this category' });
+      return;
     }
-  });
+    
+    // Create a session ID for this single player game
+    const sessionId = uuidv4();
+    
+    // Store the game session
+    gameRooms[sessionId] = {
+      id: sessionId,
+      players: [{
+        id: socket.id,
+        username: 'Player',
+        score: 0,
+        isReady: true
+      }],
+      category,
+      gameStarted: true,
+      questions: questions,
+      currentQuestionIndex: 0,
+      singlePlayer: true
+    };
+    
+    socket.join(sessionId);
+    
+    // Send the first question
+    socket.emit('singlePlayerStarted', {
+      sessionId,
+      question: {
+        ...questions[0],
+        answer: undefined // Don't send the answer to client
+      },
+      totalQuestions: questions.length,
+      currentQuestion: 1
+    });
+    
+  } catch (err) {
+    console.error('Error starting single player game:', err);
+    socket.emit('error', { message: 'Failed to start game' });
+  }
+});
 
   // Handle single player answer submission
   socket.on('submitSinglePlayerAnswer', ({ sessionId, answer }) => {
@@ -409,6 +443,100 @@ io.on('connection', (socket) => {
       }
     }
   });
+
+  // Add this to your socket.io connection handling
+socket.on('resetRoom', ({ roomId }) => {
+  const room = gameRooms[roomId];
+  
+  if (!room) {
+    // Room doesn't exist anymore, create a new one
+    const newRoomId = Math.floor(100000 + Math.random() * 900000).toString();
+    
+    gameRooms[newRoomId] = {
+      id: newRoomId,
+      players: [{
+        id: socket.id,
+        username: 'Player',
+        score: 0,
+        isReady: false,
+        isHost: true,
+        hasAnswered: false
+      }],
+      gameStarted: false,
+      questions: [],
+      currentQuestionIndex: 0
+    };
+    
+    socket.join(newRoomId);
+    socket.emit('roomCreated', { roomId: newRoomId, isHost: true });
+  } else {
+    // Reset the existing room
+    room.players = room.players.filter(p => p.id === socket.id);
+    room.gameStarted = false;
+    room.questions = [];
+    room.currentQuestionIndex = 0;
+    
+    // Update player properties
+    const player = room.players.find(p => p.id === socket.id);
+    if (player) {
+      player.score = 0;
+      player.isReady = false;
+      player.hasAnswered = false;
+      player.isHost = true;
+    } else {
+      // Add the player to the room if they're not already in it
+      room.players.push({
+        id: socket.id,
+        username: 'Player',
+        score: 0,
+        isReady: false,
+        isHost: true,
+        hasAnswered: false
+      });
+    }
+    
+    socket.join(roomId);
+    socket.emit('roomCreated', { roomId, isHost: true });
+  }
+});
+
+socket.on('rejoinRoom', ({ roomId, username, isHost }) => {
+  const room = gameRooms[roomId];
+  
+  if (!room) {
+    socket.emit('error', { message: 'Room not found' });
+    return;
+  }
+  
+  // Check if player is already in the room
+  const existingPlayer = room.players.find(p => p.id === socket.id);
+  
+  if (!existingPlayer) {
+    // Add player to room
+    room.players.push({
+      id: socket.id,
+      username,
+      score: 0,
+      isReady: false,
+      isHost: isHost
+    });
+  }
+  
+  socket.join(roomId);
+  
+  // Notify all players in the room
+  io.to(roomId).emit('playerJoined', { 
+    players: room.players.map(p => ({
+      username: p.username,
+      score: p.score,
+      isReady: p.isReady,
+      isHost: p.isHost
+    }))
+  });
+});
+
+
+
 });
 
 // Start the server

@@ -409,3 +409,5 @@ const seedDatabase = async () => {
 
 // Run the seeder
 seedDatabase();
+
+module.exports = { categories, quizQuestions };
